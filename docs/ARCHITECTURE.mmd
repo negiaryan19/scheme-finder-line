@@ -1,0 +1,99 @@
+# Architecture Diagram
+
+```mermaid
+flowchart TD
+    subgraph USER["User Phone (PSTN/VoIP)"]
+        PHONE["📞 Caller"]
+    end
+
+    subgraph TELCO["Telephony Gateway (Phase 2)"]
+        TWILIO["Twilio Media Streams\nμ-law 8kHz WebSocket"]
+    end
+
+    subgraph APP["Application Server (FastAPI)"]
+        WS["WebSocket Handler\n/audio-stream"]
+        SESSION["Session Manager\nRedis: context, profile"]
+        PRISMA["Prisma STT Client\nStreaming WebSocket"]
+        EVON["Evon LLM Client\nREST/WebSocket"]
+        TIMBRE["Timbre TTS Client\nStreaming WebSocket"]
+        RAG["Scheme KB Retriever\npgvector + PostgreSQL"]
+    end
+
+    subgraph DATA["Data Layer"]
+        PG[(PostgreSQL + pgvector\nScheme Embeddings)]
+        REDIS[(Redis\nSession Cache)]
+    end
+
+    subgraph EXTERNAL["External APIs"]
+        GNANI_STT["Gnani Prisma v3\napi.vachana.ai"]
+        GNANI_TTS["Gnani Timbre v2.5\napi.vachana.ai"]
+        GNANI_LLM["Gnani Evon v3.3\n❓ Endpoint UNKNOWN"]
+        TWILIO_API["Twilio REST API\nWhatsApp/SMS"]
+    end
+
+    PHONE -->|SIP/RTP| TWILIO
+    TWILIO -->|WSS μ-law 8kHz| WS
+    WS -->|PCM 16kHz| PRISMA
+    PRISMA -->|WSS| GNANI_STT
+    GNANI_STT -->|Interim/Final Transcript| PRISMA
+    PRISMA -->|Text + Lang| SESSION
+    SESSION -->|User Profile + Transcript| RAG
+    RAG -->|Top-K Scheme Chunks| PG
+    PG -->|Context| RAG
+    RAG -->|Enriched Prompt| EVON
+    EVON -->|REST/WSS| GNANI_LLM
+    GNANI_LLM -->|Structured JSON\n{schemes, docs, steps}| EVON
+    EVON -->|Response Text + Lang| TIMBRE
+    TIMBRE -->|WSS| GNANI_TTS
+    GNANI_TTS -->|Streaming μ-law 8kHz| TIMBRE
+    TIMBRE -->|Audio Chunks| WS
+    WS -->|WSS μ-law 8kHz| TWILIO
+    TWILIO -->|Audio| PHONE
+
+    EVON -.->|Follow-up Data| TWILIO_API
+    TWILIO_API -->|WhatsApp/SMS| PHONE
+
+    SESSION --> REDIS
+    RAG --> PG
+
+    style GNANI_LLM fill:#ffebee,stroke:#c62828
+    style TWILIO fill:#e3f2fd,stroke:#1565c0
+```
+
+---
+
+## Component Responsibilities
+
+| Component | Responsibility | Interface |
+|-----------|----------------|-----------|
+| **WebSocket Handler** | Accept Twilio Media Streams, convert μ-law 8kHz → PCM 16kHz, route audio | `websockets` + `audioop` |
+| **Session Manager** | Track call state, user profile, language, conversation history | Redis hash per `call_sid` |
+| **Prisma STT Client** | Maintain persistent WSS to Gnani, stream audio, emit transcripts | Async iterator yielding `TranscriptSegment` |
+| **Evon LLM Client** | Format prompt with retrieved schemes, call Evon, parse structured JSON | `httpx` async client |
+| **Timbre TTS Client** | Stream text chunks to Gnani, forward audio to Twilio WSS | Async generator yielding `bytes` |
+| **Scheme KB Retriever** | Embed user query, search pgvector, return top-K chunks with metadata | `sentence-transformers` + `pgvector` |
+
+---
+
+## Data Flow (Recording-Based MVP)
+
+```mermaid
+sequenceDiagram
+    participant User
+    participant TestScript as test_mvp.py
+    participant Prisma as Prisma STT
+    participant Evon as Evon LLM
+    participant Timbre as Timbre TTS
+    participant KB as Scheme KB
+
+    User->>TestScript: Record audio (Hindi/Hinglish)
+    TestScript->>Prisma: POST /transcribe (file)
+    Prisma-->>TestScript: Transcript + detected language
+    TestScript->>KB: Embed query, retrieve top-K schemes
+    KB-->>TestScript: Scheme chunks
+    TestScript->>Evon: Prompt + schemes + transcript
+    Evon-->>TestScript: Structured eligibility JSON
+    TestScript->>Timbre: POST /synthesize (text + lang)
+    Timbre-->>TestScript: Audio bytes (WAV/MP3)
+    TestScript->>User: Play audio + print transcript
+```
